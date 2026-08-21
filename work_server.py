@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID'))
 TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
 API_KEY = os.getenv('API_KEY', 'your-secret-api-key')  # Same as main server
-WORKER_ID = os.getenv('WORKER_ID', str(uuid.uuid4()[:8]))
+WORKER_ID = os.getenv('WORKER_ID', str(uuid.uuid4())[:8])
 MAX_CONCURRENT_SESSIONS = int(os.getenv('MAX_CONCURRENT_SESSIONS', '100'))
 
 # ==================== DATA MODELS ====================
