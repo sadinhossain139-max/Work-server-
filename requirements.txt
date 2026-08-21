@@ -1,0 +1,37 @@
+# FastAPI এবং ASGI Server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# Telegram Client
+pyrogram==2.0.106
+tgcrypto==1.2.5
+
+# HTTP Client
+httpx==0.25.1
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Data Validation
+pydantic==2.5.0
+email-validator==2.1.0
+
+# Logging और Monitoring
+loguru==0.7.2
+
+# Security
+python-multipart==0.0.6
+itsdangerous==2.1.2
+
+# Utility
+uuid7==0.1.0
+python-dateutil==2.8.2
+
+# Development Tools (Optional)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
