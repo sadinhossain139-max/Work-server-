@@ -35,12 +35,14 @@ TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH')
 API_KEY = os.getenv('API_KEY', 'your-secret-api-key')  # Same as main server
 WORKER_ID = os.getenv('WORKER_ID', str(uuid.uuid4())[:8])
 MAX_CONCURRENT_SESSIONS = int(os.getenv('MAX_CONCURRENT_SESSIONS', '100'))
+DEFAULT_SESSION_TIMEOUT = int(os.getenv('DEFAULT_SESSION_TIMEOUT', '300'))
 
 # ==================== DATA MODELS ====================
 class WorkerOTPRequest(BaseModel):
     session_id: str
     phone_number: str
     reject_2fa: bool = Field(False, description="Reject if account has 2FA")
+    timeout_seconds: Optional[int] = Field(None, description="Custom session timeout in seconds")
 
 class WorkerVerifyOTP(BaseModel):
     session_id: str
@@ -58,6 +60,8 @@ class TelegramClientManager:
         self.active_clients: Dict[str, Client] = {}
         self.session_data: Dict[str, Dict[str, Any]] = {}
         self.max_sessions = MAX_CONCURRENT_SESSIONS
+        self.default_session_timeout = DEFAULT_SESSION_TIMEOUT
+        self.cleanup_task: Optional[asyncio.Task] = None
     
     async def create_client(self, session_id: str) -> Client:
         """Create a new Pyrogram client"""
@@ -88,7 +92,7 @@ class TelegramClientManager:
                 detail="Failed to create Telegram client"
             )
     
-    async def request_otp(self, session_id: str, phone_number: str, reject_2fa: bool = False) -> Dict[str, Any]:
+    async def request_otp(self, session_id: str, phone_number: str, reject_2fa: bool = False, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
         """Send OTP to phone number"""
         client = await self.create_client(session_id)
         
@@ -96,11 +100,15 @@ class TelegramClientManager:
             sent_code = await client.send_code(phone_number)
             
             # Store session data
+            if timeout_seconds is None:
+                timeout_seconds = self.default_session_timeout
+            
             self.session_data[session_id] = {
                 'phone_number': phone_number,
                 'phone_code_hash': sent_code.phone_code_hash,
                 'client': client,
                 'reject_2fa': reject_2fa,
+                'timeout_seconds': timeout_seconds,
                 'created_at': datetime.utcnow()
             }
             
@@ -320,7 +328,8 @@ async def worker_request_otp(request: WorkerOTPRequest, api_key: str = Depends(v
         result = await telegram_manager.request_otp(
             request.session_id,
             request.phone_number,
-            request.reject_2fa
+            request.reject_2fa,
+            request.timeout_seconds
         )
         
         return {
@@ -394,7 +403,8 @@ async def worker_health(api_key: str = Depends(verify_api_key)):
         "worker_id": WORKER_ID,
         "active_sessions": len(telegram_manager.active_clients),
         "max_sessions": telegram_manager.max_sessions,
-        "load_percentage": (len(telegram_manager.active_clients) / telegram_manager.max_sessions) * 100
+        "load_percentage": (len(telegram_manager.active_clients) / telegram_manager.max_sessions) * 100,
+        "default_session_timeout": telegram_manager.default_session_timeout,
     }
 
 @app.get("/health")
