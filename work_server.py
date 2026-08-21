@@ -19,6 +19,7 @@ from pyrogram.errors import (
 )
 from dotenv import load_dotenv
 import logging
+import httpx
 
 load_dotenv()
 
@@ -36,6 +37,8 @@ API_KEY = os.getenv('API_KEY', 'your-secret-api-key')  # Same as main server
 WORKER_ID = os.getenv('WORKER_ID', str(uuid.uuid4())[:8])
 MAX_CONCURRENT_SESSIONS = int(os.getenv('MAX_CONCURRENT_SESSIONS', '100'))
 DEFAULT_SESSION_TIMEOUT = int(os.getenv('DEFAULT_SESSION_TIMEOUT', '300'))
+# Main Server URL for notifications
+MAIN_SERVER_URL = os.getenv('MAIN_SERVER_URL', 'https://tg-server-t88w.onrender.com')
 
 # ==================== DATA MODELS ====================
 class WorkerOTPRequest(BaseModel):
@@ -62,6 +65,7 @@ class TelegramClientManager:
         self.max_sessions = MAX_CONCURRENT_SESSIONS
         self.default_session_timeout = DEFAULT_SESSION_TIMEOUT
         self.cleanup_task: Optional[asyncio.Task] = None
+        self.http_client = httpx.AsyncClient(timeout=10.0)
     
     async def create_client(self, session_id: str) -> Client:
         """Create a new Pyrogram client"""
@@ -281,10 +285,26 @@ class TelegramClientManager:
                 self.active_clients.pop(session_id, None)
                 self.session_data.pop(session_id, None)
     
+    async def notify_session_expired(self, session_id: str) -> None:
+        """Main Server-কে session expiry notification পাঠান"""
+        try:
+            response = await self.http_client.post(
+                f"{MAIN_SERVER_URL}/worker/session-expired",
+                json={"session_id": session_id},
+                headers={"X-API-Key": API_KEY}
+            )
+            if response.status_code == 200:
+                logger.info(f"📤 Expiry notification sent to Main Server: {session_id}")
+            else:
+                logger.warning(f"⚠️ Failed to notify Main Server: {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Error notifying Main Server: {e}")
+    
     async def cleanup_all(self):
         """Cleanup all clients"""
         for session_id in list(self.active_clients.keys()):
             await self.disconnect_client(session_id)
+        await self.http_client.aclose()
         logger.info("✅ All clients cleaned up")
 
 # ==================== AUTHENTICATION ====================
