@@ -111,6 +111,7 @@ class ProxyInfo(BaseModel):
     country_name: str
     protocol: str = "socks5"
     is_active: bool = True
+    max_sessions: int = 10
 
 class AdminProxyAddRequest(BaseModel):
     proxies: List[ProxyInfo]
@@ -223,16 +224,16 @@ class ProxyManager:
         
         async with self.db_lock:
             try:
-                async with self.pool.acquire() as conn:
+               async with self.pool.acquire() as conn:
                     rows = await conn.fetch(
                         """
-                        SELECT id, host, port, username, password, country_code, 
-                               country_name, protocol, is_active, last_used, 
-                               success_count, fail_count, ping_ms
+                        SELECT id, proxy_data, country_code, is_active, 
+                               last_used, success_count, fail_count, ping_ms
                         FROM proxies 
                         WHERE country_code = $1 
                           AND is_active = true 
                           AND (last_used IS NULL OR last_used < NOW() - INTERVAL '30 seconds')
+                          AND current_usage < max_usage
                         ORDER BY 
                             CASE 
                                 WHEN fail_count > 3 THEN 1 
@@ -248,19 +249,20 @@ class ProxyManager:
                     
                     proxies = []
                     for row in rows:
+                        proxy_data = row['proxy_data']
                         proxy = ProxyInfo(
                             id=row['id'],
-                            host=row['host'],
-                            port=row['port'],
-                            username=row['username'],
-                            password=row['password'],
+                            host=proxy_data.get('host', ''),
+                            port=proxy_data.get('port', 0),
+                            username=proxy_data.get('username'),
+                            password=proxy_data.get('password'),
                             country_code=row['country_code'],
-                            country_name=row['country_name'],
-                            protocol=row['protocol'],
+                            country_name=proxy_data.get('country_name', ''),
+                            protocol=proxy_data.get('protocol', 'socks5'),
                             is_active=row['is_active']
                         )
                         proxies.append(proxy)
-                    
+                
                     # Update cache
                     async with self.cache_lock:
                         self.proxy_cache[cache_key] = proxies
@@ -971,13 +973,24 @@ async def admin_add_proxies(
         async with proxy_manager.pool.acquire() as conn:
             for proxy in request.proxies:
                 try:
+                    # Build proxy_data JSON
+                    proxy_data = {
+                        "host": proxy.host,
+                        "port": proxy.port,
+                        "username": proxy.username,
+                        "password": proxy.password,
+                        "protocol": proxy.protocol,
+                        "country_name": proxy.country_name
+                    }
+                    
                     # Check for duplicates
                     existing = await conn.fetchrow(
                         """
                         SELECT id FROM proxies 
-                        WHERE host = $1 AND port = $2 AND username = $3
+                        WHERE proxy_data->>'host' = $1 
+                        AND proxy_data->>'port' = $2
                         """,
-                        proxy.host, proxy.port, proxy.username
+                        proxy.host, str(proxy.port)
                     )
                     
                     if existing:
@@ -988,20 +1001,16 @@ async def admin_add_proxies(
                         })
                         continue
                     
-                    # Insert new proxy
+                    # Insert new proxy with JSONB data
                     await conn.execute(
                         """
                         INSERT INTO proxies 
-                        (host, port, username, password, country_code, country_name, protocol, is_active)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+                        (proxy_data, country_code, is_active, max_usage)
+                        VALUES ($1::jsonb, $2, true, $3)
                         """,
-                        proxy.host,
-                        proxy.port,
-                        proxy.username,
-                        proxy.password,
+                        proxy_data,
                         proxy.country_code,
-                        proxy.country_name,
-                        proxy.protocol
+                        proxy.max_sessions if hasattr(proxy, 'max_sessions') else 10
                     )
                     added_count += 1
                     logger.info(f"✅ Added proxy: {proxy.host}:{proxy.port} ({proxy.country_code})")
