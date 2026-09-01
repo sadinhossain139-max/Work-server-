@@ -1,15 +1,36 @@
+# Web Framework
 fastapi==0.104.1
-uvicorn==0.24.0
+uvicorn[standard]==0.24.0
+starlette==0.27.0
+
+# Telegram
 pyrogram==2.0.106
 TgCrypto==1.2.5
-python-dotenv==1.0.0
-pydantic==2.5.0
-httpx==0.25.1
+pysocks==1.7.1
+
+# Database
+asyncpg==0.29.0
 psycopg2-binary==2.9.9
+SQLAlchemy==2.0.23
+alembic==1.12.1
+
+# HTTP Clients
+httpx==0.25.1
+aiohttp==3.9.1
+requests==2.31.0
+
+# Data Validation
+pydantic==2.5.0
+python-dotenv==1.0.0
+
+# Security
+cryptography==41.0.7
+
+# Utilities
 faker==20.1.0
 aiofiles==23.2.1
 Pillow==10.1.0
-asyncpg==0.29.0
-SQLAlchemy==2.0.23
-cryptography
-alembic==1.12.1
+
+# Async
+anyio==3.7.1
+greenlet==3.0.3
