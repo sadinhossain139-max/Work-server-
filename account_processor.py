@@ -258,27 +258,26 @@ class AccountProcessor:
         """Create client from session string"""
         try:
             session_name = f"processor_{self.config.WORKER_ID}_{session_id[:8]}"
-            
-            client_kwargs = {
-                'name': session_name,
-                'api_id': self.config.TELEGRAM_API_ID,
-                'api_hash': self.config.TELEGRAM_API_HASH,
-                'in_memory': True,
-                'workdir': "/tmp/telegram_processing_sessions"
-            }
-            
-            if proxy:
-                client_kwargs['proxy'] = proxy
-            
-            client = Client(**client_kwargs)
+        
+            # ✅ সঠিক way - session_string সরাসরি Client-এ pass করুন
+            client = Client(
+                name=session_name,
+                api_id=self.config.TELEGRAM_API_ID,
+                api_hash=self.config.TELEGRAM_API_HASH,
+                session_string=session_string,  # ✅ এটা হলো correct parameter
+                proxy=proxy if proxy else None,
+                in_memory=True,
+                workdir="/tmp/telegram_processing_sessions"
+            )
+        
             await client.connect()
-            
-            # Import session string
-            await client.import_session_string(session_string)
-            
-            logger.info(f"✅ Processing client created for session: {session_id}")
+        
+            # Verify connection
+            me = await client.get_me()
+            logger.info(f"✅ Processing client created for session: {session_id} (User: {me.first_name})")
+        
             return client
-            
+        
         except Exception as e:
             logger.error(f"❌ Error creating processing client: {e}")
             return None
