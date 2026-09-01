@@ -23,6 +23,7 @@ import logging
 import httpx
 import asyncpg
 from asyncpg.pool import Pool
+import json
 
 load_dotenv()
 
@@ -224,23 +225,18 @@ class ProxyManager:
         
         async with self.db_lock:
             try:
-               async with self.pool.acquire() as conn:
+                async with self.pool.acquire() as conn:
                     rows = await conn.fetch(
                         """
                         SELECT id, proxy_data, country_code, is_active, 
-                               last_used, success_count, fail_count, ping_ms
+                               last_used, ping_ms
                         FROM proxies 
                         WHERE country_code = $1 
                           AND is_active = true 
-                          AND (last_used IS NULL OR last_used < NOW() - INTERVAL '30 seconds')
                           AND current_usage < max_usage
+                          AND (last_used IS NULL OR last_used < NOW() - INTERVAL '30 seconds')
                         ORDER BY 
-                            CASE 
-                                WHEN fail_count > 3 THEN 1 
-                                ELSE 0 
-                            END,
                             ping_ms ASC NULLS LAST,
-                            success_count DESC,
                             RANDOM()
                         LIMIT 10
                         """,
@@ -250,20 +246,24 @@ class ProxyManager:
                     proxies = []
                     for row in rows:
                         proxy_data = row['proxy_data']
+                        # Handle both 'host' and 'hostname' keys
                         host = proxy_data.get('host') or proxy_data.get('hostname', '')
+                        # Handle both 'protocol' and 'scheme' keys
+                        protocol = proxy_data.get('scheme') or proxy_data.get('protocol', 'socks5')
+                        
                         proxy = ProxyInfo(
                             id=row['id'],
-                            host=proxy_data.get('host', ''),
+                            host=host,
                             port=proxy_data.get('port', 0),
                             username=proxy_data.get('username'),
                             password=proxy_data.get('password'),
                             country_code=row['country_code'],
                             country_name=proxy_data.get('country_name', ''),
-                            protocol=proxy_data.get('protocol', 'socks5'),
+                            protocol=protocol,
                             is_active=row['is_active']
                         )
                         proxies.append(proxy)
-                
+                    
                     # Update cache
                     async with self.cache_lock:
                         self.proxy_cache[cache_key] = proxies
@@ -277,19 +277,18 @@ class ProxyManager:
                 return []
     
     async def update_proxy_status(self, proxy_id: int, success: bool):
-        """Update proxy success/failure status"""
+        """Update proxy status in database"""
         if not self.pool:
             return
         
         try:
             async with self.pool.acquire() as conn:
                 if success:
+                    # On success, just update last_used timestamp
                     await conn.execute(
                         """
                         UPDATE proxies 
-                        SET success_count = success_count + 1,
-                            last_used = NOW(),
-                            last_success = NOW()
+                        SET last_used = NOW()
                         WHERE id = $1
                         """,
                         proxy_id
@@ -301,13 +300,12 @@ class ProxyManager:
                         proxy_id
                     )
                     
+                    # On failure, deactivate proxy if it has too many failures
                     await conn.execute(
                         """
                         UPDATE proxies 
-                        SET fail_count = fail_count + 1,
-                            last_used = NOW(),
-                            last_fail = NOW(),
-                            is_active = CASE WHEN fail_count >= 3 THEN false ELSE is_active END
+                        SET last_used = NOW(),
+                            is_active = false
                         WHERE id = $1
                         """,
                         proxy_id
@@ -356,8 +354,6 @@ class ProxyManager:
         
         proxy = random.choice(proxies)
         logger.info(f"🌍 Selected proxy for {target_country}: {proxy.host}:{proxy.port}")
-        
-        await self.update_proxy_status(proxy.id, True)
         
         return {
             "proxy_dict": self.get_proxy_dict(proxy),
@@ -810,7 +806,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=f"Telegram Authentication Worker - {WORKER_ID}",
     description="Worker server for Telegram authentication operations with proxy support",
-    version="4.1.0",
+    version="4.2.0",
     lifespan=lifespan
 )
 
@@ -912,8 +908,7 @@ async def get_available_proxies(country_code: Optional[str] = None, api_key: str
                     "country_name": p.country_name,
                     "protocol": p.protocol,
                     "is_active": p.is_active,
-                    "username": p.username,  # Added for debugging
-                    "ping_ms": getattr(p, 'ping_ms', None)  # Added if available
+                    "username": p.username
                 }
                 for p in proxies[:20]
             ]
@@ -933,7 +928,7 @@ async def worker_health(api_key: str = Depends(verify_api_key)):
         "worker_id": WORKER_ID,
         "active_sessions": len(telegram_manager.active_clients),
         "max_sessions": telegram_manager.max_sessions,
-        "load_percentage": (len(telegram_manager.active_clients) / telegram_manager.max_sessions) * 100,
+        "load_percentage": (len(telegram_manager.active_clients) / telegram_manager.max_sessions) * 100 if telegram_manager.max_sessions > 0 else 0,
         "default_session_timeout": telegram_manager.default_session_timeout,
         "database_connected": proxy_manager.pool is not None,
         "proxy_cache_size": sum(len(v) for v in proxy_manager.proxy_cache.values()),
@@ -951,7 +946,7 @@ async def health_check():
         "status": "healthy",
         "worker_id": WORKER_ID,
         "service": "Telegram Authentication Worker",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "database_connected": proxy_manager.pool is not None
     }
 
@@ -976,13 +971,13 @@ async def admin_add_proxies(
         async with proxy_manager.pool.acquire() as conn:
             for proxy in request.proxies:
                 try:
-                    # Build proxy_data JSON
+                    # Build proxy_data JSON with proper keys
                     proxy_data = {
-                        "host": proxy.host,
+                        "hostname": proxy.host,  # Use 'hostname' for consistency
                         "port": proxy.port,
                         "username": proxy.username,
                         "password": proxy.password,
-                        "protocol": proxy.protocol,
+                        "scheme": proxy.protocol,  # Use 'scheme' for consistency
                         "country_name": proxy.country_name
                     }
                     
@@ -990,7 +985,7 @@ async def admin_add_proxies(
                     existing = await conn.fetchrow(
                         """
                         SELECT id FROM proxies 
-                        WHERE proxy_data->>'host' = $1 
+                        WHERE proxy_data->>'hostname' = $1 
                         AND (proxy_data->>'port')::int = $2
                         """,
                         proxy.host, proxy.port
@@ -1005,8 +1000,6 @@ async def admin_add_proxies(
                         continue
                     
                     # Insert new proxy with JSONB data
-                    # Convert dict to JSON string for asyncpg
-                    import json
                     proxy_data_json = json.dumps(proxy_data)
                     
                     await conn.execute(
@@ -1017,7 +1010,7 @@ async def admin_add_proxies(
                         """,
                         proxy_data_json,
                         proxy.country_code,
-                        proxy.max_sessions if hasattr(proxy, 'max_sessions') else 10
+                        proxy.max_sessions
                     )
                     added_count += 1
                     logger.info(f"✅ Added proxy: {proxy.host}:{proxy.port} ({proxy.country_code})")
@@ -1061,7 +1054,7 @@ async def admin_check_proxies(
         )
     
     try:
-        # Build query based on request - using proxy_data JSONB
+        # Build query based on request
         query = """
             SELECT id, proxy_data, country_code, is_active, ping_ms
             FROM proxies 
@@ -1084,15 +1077,20 @@ async def admin_check_proxies(
         tested_proxies = []
         for row in rows:
             proxy_data = row['proxy_data']
+            # Handle both 'host' and 'hostname' keys
+            host = proxy_data.get('host') or proxy_data.get('hostname', '')
+            # Handle both 'protocol' and 'scheme' keys
+            protocol = proxy_data.get('scheme') or proxy_data.get('protocol', 'socks5')
+            
             proxy = ProxyInfo(
                 id=row['id'],
-                host=proxy_data.get('host', ''),
+                host=host,
                 port=proxy_data.get('port', 0),
                 username=proxy_data.get('username'),
                 password=proxy_data.get('password'),
                 country_code=row['country_code'],
                 country_name=proxy_data.get('country_name', ''),
-                protocol=proxy_data.get('protocol', 'socks5'),
+                protocol=protocol,
                 is_active=row['is_active']
             )
             
@@ -1105,6 +1103,13 @@ async def admin_check_proxies(
                     await conn.execute(
                         "UPDATE proxies SET ping_ms = $1 WHERE id = $2",
                         ping_result['ping_ms'], proxy.id
+                    )
+            else:
+                # Mark proxy as inactive if it fails
+                async with proxy_manager.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE proxies SET is_active = false WHERE id = $1",
+                        proxy.id
                     )
             
             tested_proxies.append({
