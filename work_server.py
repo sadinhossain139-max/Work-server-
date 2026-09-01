@@ -923,7 +923,6 @@ async def get_available_proxies(country_code: Optional[str] = None, api_key: str
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get proxy information"
         )
-        )
 
 @app.get("/worker/health")
 async def worker_health(api_key: str = Depends(verify_api_key)):
