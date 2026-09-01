@@ -246,6 +246,9 @@ class ProxyManager:
                     proxies = []
                     for row in rows:
                         proxy_data = row['proxy_data']
+                        if isinstance(proxy_data, str):
+                            import json
+                            proxy_data = json.loads(proxy_data)
                         # Handle both 'host' and 'hostname' keys
                         host = proxy_data.get('host') or proxy_data.get('hostname', '')
                         # Handle both 'protocol' and 'scheme' keys
@@ -1076,7 +1079,12 @@ async def admin_check_proxies(
         # Test each proxy
         tested_proxies = []
         for row in rows:
+            # Fix: Convert proxy_data to dict if it's string
             proxy_data = row['proxy_data']
+            if isinstance(proxy_data, str):
+                import json
+                proxy_data = json.loads(proxy_data)
+            
             # Handle both 'host' and 'hostname' keys
             host = proxy_data.get('host') or proxy_data.get('hostname', '')
             # Handle both 'protocol' and 'scheme' keys
