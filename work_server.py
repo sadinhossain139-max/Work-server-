@@ -250,6 +250,7 @@ class ProxyManager:
                     proxies = []
                     for row in rows:
                         proxy_data = row['proxy_data']
+                        host = proxy_data.get('host') or proxy_data.get('hostname', '')
                         proxy = ProxyInfo(
                             id=row['id'],
                             host=proxy_data.get('host', ''),
