@@ -910,7 +910,9 @@ async def get_available_proxies(country_code: Optional[str] = None, api_key: str
                     "country_code": p.country_code,
                     "country_name": p.country_name,
                     "protocol": p.protocol,
-                    "is_active": p.is_active
+                    "is_active": p.is_active,
+                    "username": p.username,  # Added for debugging
+                    "ping_ms": getattr(p, 'ping_ms', None)  # Added if available
                 }
                 for p in proxies[:20]
             ]
@@ -920,6 +922,7 @@ async def get_available_proxies(country_code: Optional[str] = None, api_key: str
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get proxy information"
+        )
         )
 
 @app.get("/worker/health")
@@ -988,9 +991,9 @@ async def admin_add_proxies(
                         """
                         SELECT id FROM proxies 
                         WHERE proxy_data->>'host' = $1 
-                        AND proxy_data->>'port' = $2
+                        AND (proxy_data->>'port')::int = $2
                         """,
-                        proxy.host, str(proxy.port)
+                        proxy.host, proxy.port
                     )
                     
                     if existing:
@@ -1002,13 +1005,17 @@ async def admin_add_proxies(
                         continue
                     
                     # Insert new proxy with JSONB data
+                    # Convert dict to JSON string for asyncpg
+                    import json
+                    proxy_data_json = json.dumps(proxy_data)
+                    
                     await conn.execute(
                         """
                         INSERT INTO proxies 
-                        (proxy_data, country_code, is_active, max_usage)
-                        VALUES ($1::jsonb, $2, true, $3)
+                        (proxy_data, country_code, is_active, max_usage, current_usage)
+                        VALUES ($1::jsonb, $2, true, $3, 0)
                         """,
-                        proxy_data,
+                        proxy_data_json,
                         proxy.country_code,
                         proxy.max_sessions if hasattr(proxy, 'max_sessions') else 10
                     )
@@ -1054,10 +1061,9 @@ async def admin_check_proxies(
         )
     
     try:
-        # Build query based on request
+        # Build query based on request - using proxy_data JSONB
         query = """
-            SELECT id, host, port, username, password, country_code, 
-                   country_name, protocol, is_active, ping_ms
+            SELECT id, proxy_data, country_code, is_active, ping_ms
             FROM proxies 
             WHERE is_active = true
         """
@@ -1072,21 +1078,22 @@ async def admin_check_proxies(
         params.append(request.limit or 10)
         
         async with proxy_manager.pool.acquire() as conn:
-            proxies = await conn.fetch(query, *params)
+            rows = await conn.fetch(query, *params)
         
         # Test each proxy
         tested_proxies = []
-        for proxy_row in proxies:
+        for row in rows:
+            proxy_data = row['proxy_data']
             proxy = ProxyInfo(
-                id=proxy_row['id'],
-                host=proxy_row['host'],
-                port=proxy_row['port'],
-                username=proxy_row['username'],
-                password=proxy_row['password'],
-                country_code=proxy_row['country_code'],
-                country_name=proxy_row['country_name'],
-                protocol=proxy_row['protocol'],
-                is_active=proxy_row['is_active']
+                id=row['id'],
+                host=proxy_data.get('host', ''),
+                port=proxy_data.get('port', 0),
+                username=proxy_data.get('username'),
+                password=proxy_data.get('password'),
+                country_code=row['country_code'],
+                country_name=proxy_data.get('country_name', ''),
+                protocol=proxy_data.get('protocol', 'socks5'),
+                is_active=row['is_active']
             )
             
             # Test proxy ping
