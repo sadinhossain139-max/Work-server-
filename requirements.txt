@@ -11,4 +11,5 @@ aiofiles==23.2.1
 Pillow==10.1.0
 asyncpg==0.29.0
 SQLAlchemy==2.0.23
+cryptography
 alembic==1.12.1
