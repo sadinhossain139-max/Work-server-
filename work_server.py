@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, HTTPException, status, Header, Depends
+from fastapi import FastAPI, HTTPException, status, Header, Depends, Request
 from pydantic import BaseModel, Field, validator
 from pyrogram import Client
 from pyrogram.errors import (
