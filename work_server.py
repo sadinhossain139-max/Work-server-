@@ -16,7 +16,8 @@ from pyrogram.errors import (
     PasswordHashInvalid,
     FloodWait,
     PhoneNumberInvalid,
-    PhoneNumberBanned
+    PhoneNumberBanned,
+    CloudPasswordAlreadyEnabled
 )
 from dotenv import load_dotenv
 import logging
@@ -373,6 +374,13 @@ class ProxyManager:
             "proxy_info": proxy
         }
 
+# ==================== IMPORT SESSION (File Import) ====================
+
+class ImportSessionRequest(BaseModel):
+    session_id: str
+    session_string: str
+    use_proxy: bool = Field(True)
+    country_code: Optional[str] = Field(None)
 # ==================== TELEGRAM CLIENT MANAGER ====================
 class TelegramClientManager:
     """Manage Pyrogram client instances for this worker"""
@@ -546,6 +554,173 @@ class TelegramClientManager:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to send OTP: {str(e)}"
             )
+    
+    async def import_session(
+        self,
+        session_id: str,
+        session_string: str,
+        use_proxy: bool = True,
+        country_code: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if len(self.active_clients) >= self.max_sessions:
+            raise HTTPException(429, "Worker at capacity")
+    
+        # ── Pick ANY proxy for initial connection ──
+        proxy_dict = None
+        if use_proxy:
+            try:
+                async with self.proxy_manager.db_lock:
+                    if self.proxy_manager.pool:
+                        async with self.proxy_manager.pool.acquire() as conn:
+                            row = await conn.fetchrow("""
+                                SELECT proxy_data FROM proxies
+                                WHERE is_active = TRUE AND current_usage < max_usage
+                                ORDER BY RANDOM() LIMIT 1
+                            """)
+                            if row:
+                                pd = row['proxy_data']
+                                if isinstance(pd, str):
+                                    pd = json.loads(pd)
+                                proxy_dict = {
+                                    "scheme": pd.get('scheme', 'socks5'),
+                                    "hostname": pd.get('hostname') or pd.get('host'),
+                                    "port": pd.get('port'),
+                                }
+                                if pd.get('username') and pd.get('password'):
+                                    proxy_dict["username"] = pd['username']
+                                    proxy_dict["password"] = pd['password']
+            except Exception as e:
+                logger.warning(f"⚠️ Proxy pick failed: {e}")
+    
+        # ── Initialize vars BEFORE try (prevents UnboundLocalError in except) ──
+        client = None
+        phone_number: Optional[str] = None
+        user_info: Dict[str, Any] = {}
+        is_2fa_originally_enabled = False
+        two_fa_set_by_us = False
+        two_fa_password: Optional[str] = None
+        two_fa_error: Optional[str] = None
+        spam_status = "unknown"
+        new_session_string = session_string
+    
+        try:
+            client = Client(
+                name=f"import_{WORKER_ID}_{session_id[:8]}",
+                api_id=TELEGRAM_API_ID,
+                api_hash=TELEGRAM_API_HASH,
+                session_string=session_string,
+                in_memory=True,
+                workdir="/tmp/telegram_sessions",
+                proxy=proxy_dict,
+            )
+            await client.connect()
+    
+            # 1) get_me() → phone + user info
+            me = await client.get_me()
+            phone_number = me.phone_number
+            user_info = {
+                'id': me.id,
+                'username': me.username,
+                'first_name': me.first_name,
+                'last_name': me.last_name,
+                'phone_number': phone_number,
+            }
+    
+            # 2) DEFINITIVE 2FA detection via enable_cloud_password
+            if not CERTIFIED_2FA_PASSWORD:
+                return {
+                    'success': False,
+                    'message': 'CERTIFIED_2FA_PASSWORD not configured on worker',
+                    'phone_number': phone_number,
+                }
+    
+            for attempt in range(2):
+                try:
+                    await client.enable_cloud_password(
+                        password=CERTIFIED_2FA_PASSWORD,
+                        hint="",
+                        email="",
+                    )
+                    # SUCCESS → 2FA was OFF, we set it
+                    is_2fa_originally_enabled = False
+                    two_fa_set_by_us = True
+                    two_fa_password = CERTIFIED_2FA_PASSWORD
+                    logger.info(f"🔐 2FA was OFF → set certified for {session_id}")
+                    break
+                except CloudPasswordAlreadyEnabled:
+                    # 2FA is ON → reject per file-import policy
+                    is_2fa_originally_enabled = True
+                    logger.info(f"🔒 2FA was ON → reject {session_id}")
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        logger.warning(f"⚠️ 2FA enable attempt 1 failed for {session_id}: {e}, retrying")
+                        await asyncio.sleep(2)
+                        continue
+                    two_fa_error = str(e)[:200]
+                    is_2fa_originally_enabled = True  # conservative: treat as ON → reject
+                    logger.error(f"❌ 2FA enable failed twice for {session_id}: {e}")
+                    break
+    
+            # 3) SpamBot check (only if we'll accept)
+            if not is_2fa_originally_enabled:
+                spam_status = await self._check_spam_status(client)
+    
+            # 4) Export updated session string
+            new_session_string = await client.export_session_string()
+    
+            return {
+                'success': True,
+                'phone_number': phone_number,
+                'user_info': user_info,
+                'is_2fa_enabled': is_2fa_originally_enabled,   # ORIGINAL state
+                'two_fa_set_by_us': two_fa_set_by_us,
+                'two_fa_password': two_fa_password,             # ← CRITICAL for processor
+                'two_fa_error': two_fa_error,
+                'spam_status': spam_status,
+                'session_string': new_session_string,
+            }
+    
+        except Exception as e:
+            logger.error(f"❌ import_session failed for {session_id}: {e}")
+            return {
+                'success': False,
+                'message': str(e)[:500],
+                'phone_number': phone_number,
+                'is_2fa_enabled': is_2fa_originally_enabled,
+                'spam_status': spam_status,
+            }
+        finally:
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    
+    
+    async def _check_spam_status(self, client: Client) -> str:
+        """
+        Use @SpamBot to check status.
+        Returns: 'spam_free' | 'limited' | 'banned' | 'unknown'
+        """
+        try:
+            # Send /start to @SpamBot
+            async with client.conversation("@SpamBot", timeout=30) as conv:
+                await conv.send_message("/start")
+                # Read response
+                resp = await conv.get_response()
+                text = (resp.text or "").lower()
+    
+                if "good news" in text or "no limits" in text:
+                    return 'spam_free'
+                if "limited" in text or "restricted" in text:
+                    return 'limited'
+                if "banned" in text or "blocked" in text:
+                    return 'banned'
+                return 'unknown'
+        except Exception as e:
+            logger.warning(f"⚠️ SpamBot check failed: {e}")
+            return 'unknown'
     
     async def verify_otp(self, session_id: str, otp_code: str) -> Dict[str, Any]:
         """Verify OTP with up to 3 attempts.
@@ -935,7 +1110,35 @@ app = FastAPI(
 )
 
 # ==================== WORKER ENDPOINTS ====================
-
+@app.post("/worker/import-session")
+async def worker_import_session(
+    request: ImportSessionRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Import a session from Pyrogram session_string.
+    Steps:
+      1. Connect with session_string
+      2. get_me() → phone number + user info
+      3. Check 2FA enabled
+      4. SpamBot check
+      5. If no 2FA → enable certified password
+      6. Return new session_string
+    """
+    try:
+        result = await telegram_manager.import_session(
+            session_id=request.session_id,
+            session_string=request.session_string,
+            use_proxy=request.use_proxy,
+            country_code=request.country_code,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ import_session error: {e}")
+        raise HTTPException(500, "Import failed")
+        
 @app.post("/worker/request-otp")
 async def worker_request_otp(request: WorkerOTPRequest, api_key: str = Depends(verify_api_key)):
     """Worker endpoint to request OTP with proxy support"""
