@@ -612,7 +612,7 @@ class TelegramClientManager:
                 workdir="/tmp/telegram_sessions",
                 proxy=proxy_dict,
             )
-            await client.connect()
+            await client.start()
     
             # 1) get_me() → phone + user info
             me = await client.get_me()
@@ -713,24 +713,32 @@ class TelegramClientManager:
     
     async def _check_spam_status(self, client: Client) -> str:
         """
-        Use @SpamBot to check status.
+        Use @SpamBot to check status (raw message approach, no conversation).
         Returns: 'spam_free' | 'limited' | 'banned' | 'unknown'
         """
         try:
-            # Send /start to @SpamBot
-            async with client.conversation("@SpamBot", timeout=30) as conv:
-                await conv.send_message("/start")
-                # Read response
-                resp = await conv.get_response()
-                text = (resp.text or "").lower()
-    
-                if "good news" in text or "no limits" in text:
-                    return 'spam_free'
-                if "limited" in text or "restricted" in text:
-                    return 'limited'
-                if "banned" in text or "blocked" in text:
-                    return 'banned'
+            # Send /start directly
+            await client.send_message("@SpamBot", "/start")
+            
+            # Wait for SpamBot to reply
+            await asyncio.sleep(3)
+            
+            # Fetch the latest message from SpamBot
+            text = ""
+            async for message in client.get_chat_history("@SpamBot", limit=1):
+                text = (message.text or "").lower()
+                break
+            
+            if not text:
                 return 'unknown'
+    
+            if "good news" in text or "no limits" in text:
+                return 'spam_free'
+            if "limited" in text or "restricted" in text:
+                return 'limited'
+            if "banned" in text or "blocked" in text:
+                return 'banned'
+            return 'unknown'
         except Exception as e:
             logger.warning(f"⚠️ SpamBot check failed: {e}")
             return 'unknown'
