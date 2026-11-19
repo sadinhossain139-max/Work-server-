@@ -17,7 +17,6 @@ from pyrogram.errors import (
     FloodWait,
     PhoneNumberInvalid,
     PhoneNumberBanned,
-    CloudPasswordAlreadyEnabled
 )
 from dotenv import load_dotenv
 import logging
@@ -626,41 +625,55 @@ class TelegramClientManager:
                 'phone_number': phone_number,
             }
     
-            # 2) DEFINITIVE 2FA detection via enable_cloud_password
+            # 2) DEFINITIVE 2FA detection
             if not CERTIFIED_2FA_PASSWORD:
                 return {
                     'success': False,
                     'message': 'CERTIFIED_2FA_PASSWORD not configured on worker',
                     'phone_number': phone_number,
                 }
-    
-            for attempt in range(2):
+            
+            # Step A: get_password_hint() — reliable detection
+            # Returns None  → 2FA is OFF
+            # Returns string (even "") → 2FA is ON
+            try:
+                hint = await client.get_password_hint()
+                is_2fa_originally_enabled = hint is not None
+                logger.info(
+                    f"🔍 2FA check via get_password_hint: "
+                    f"hint={'None' if hint is None else repr(hint)} "
+                    f"→ is_2fa={is_2fa_originally_enabled} for {session_id}"
+                )
+            except Exception as e:
+                # Unknown state — be conservative, assume 2FA on
+                is_2fa_originally_enabled = True
+                two_fa_error = f"hint_check_failed: {str(e)[:150]}"
+                logger.warning(f"⚠️ get_password_hint failed for {session_id}: {e} → assuming 2FA ON")
+            
+            # Step B: if 2FA off → enable certified password
+            if not is_2fa_originally_enabled:
                 try:
                     await client.enable_cloud_password(
                         password=CERTIFIED_2FA_PASSWORD,
                         hint="",
                         email="",
                     )
-                    # SUCCESS → 2FA was OFF, we set it
-                    is_2fa_originally_enabled = False
                     two_fa_set_by_us = True
                     two_fa_password = CERTIFIED_2FA_PASSWORD
                     logger.info(f"🔐 2FA was OFF → set certified for {session_id}")
-                    break
-                except CloudPasswordAlreadyEnabled:
-                    # 2FA is ON → reject per file-import policy
+                except PasswordHashInvalid:
+                    # Race: hint said off, but enable fails → actually ON
                     is_2fa_originally_enabled = True
-                    logger.info(f"🔒 2FA was ON → reject {session_id}")
-                    break
+                    two_fa_set_by_us = False
+                    two_fa_password = None
+                    logger.warning(f"🔒 Race detected: 2FA actually ON for {session_id} → reject")
                 except Exception as e:
-                    if attempt == 0:
-                        logger.warning(f"⚠️ 2FA enable attempt 1 failed for {session_id}: {e}, retrying")
-                        await asyncio.sleep(2)
-                        continue
-                    two_fa_error = str(e)[:200]
-                    is_2fa_originally_enabled = True  # conservative: treat as ON → reject
-                    logger.error(f"❌ 2FA enable failed twice for {session_id}: {e}")
-                    break
+                    # Any other failure → conservative: treat as ON
+                    is_2fa_originally_enabled = True
+                    two_fa_set_by_us = False
+                    two_fa_password = None
+                    two_fa_error = f"enable_failed: {str(e)[:150]}"
+                    logger.error(f"❌ enable_cloud_password failed for {session_id}: {e} → reject")
     
             # 3) SpamBot check (only if we'll accept)
             if not is_2fa_originally_enabled:
